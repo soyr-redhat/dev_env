@@ -25,14 +25,16 @@ const PRECISION_PATTERNS = [
   [/fp16/i, 'fp16'],
 ];
 
-const VRAM_FROM_GPU = {
-  'NVIDIA-H100-80GB-HBM3': 80,
-  'NVIDIA-A100-SXM4-80GB': 80,
-  'NVIDIA-A100-SXM4-40GB': 40,
-  'NVIDIA-A100-PCIE-40GB': 40,
-  'NVIDIA-A10G': 24,
-  'NVIDIA-L4': 24,
-  'NVIDIA-L40S': 48,
+const BYTES_PER_PARAM = {
+  bf16: 2,
+  fp16: 2,
+  fp8: 1,
+  nvfp4: 0.5,
+  fp4: 0.5,
+  int4: 0.5,
+  int8: 1,
+  awq: 0.5,
+  gptq: 0.5,
 };
 
 const TASK_MAP = {
@@ -78,10 +80,16 @@ function inferActiveParams(modelId) {
   return null;
 }
 
-function inferVram(nodeSelector) {
-  if (!nodeSelector) return 80;
-  const gpu = nodeSelector['nvidia.com/gpu.product'];
-  return (gpu && VRAM_FROM_GPU[gpu]) || 80;
+function estimateVram(totalParams, precision, gpuCount) {
+  if (!totalParams) return 80;
+  const bytesPerParam = BYTES_PER_PARAM[precision] || 2;
+  const modelGb = (totalParams * bytesPerParam) / 1e9;
+  // ~20% overhead for KV cache, activations, CUDA context
+  const totalGb = modelGb * 1.2;
+  const perGpu = totalGb / (gpuCount || 1);
+  // round up to nearest common VRAM tier
+  const tiers = [16, 24, 40, 48, 80];
+  return tiers.find((t) => t >= perGpu) || 80;
 }
 
 function formatParamCount(total) {
@@ -274,7 +282,7 @@ async function convert(input) {
       default: {
         precision,
         min_gpus: gpuCount,
-        vram_minimum_gb: inferVram(nodeSelector),
+        vram_minimum_gb: estimateVram(hf?.totalParams, precision, gpuCount),
         description: 'TODO: Add variant description',
       },
     },
