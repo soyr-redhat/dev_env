@@ -1,0 +1,55 @@
+#!/bin/bash
+# One-time dev server setup — each step is idempotent
+set -euo pipefail
+
+REPOS_DIR="$HOME/repos"
+VENVS_DIR="$HOME/.venvs"
+
+echo "=== One-time setup ==="
+
+# ---------- repos ----------
+clone_if_missing() {
+    local repo="$1"
+    local dest="$REPOS_DIR/$(basename "$repo" .git)"
+    if [ ! -d "$dest" ]; then
+        echo "Cloning $repo..."
+        git clone "$repo" "$dest"
+    else
+        echo "Already cloned: $dest"
+    fi
+}
+
+mkdir -p "$REPOS_DIR"
+clone_if_missing https://github.com/vllm-project/llm-compressor.git
+clone_if_missing https://github.com/vllm-project/compressed-tensors.git
+clone_if_missing https://github.com/vllm-project/vllm.git
+
+# ---------- uv ----------
+if ! command -v uv &>/dev/null; then
+    echo "Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+else
+    echo "uv already installed"
+fi
+
+# ---------- venvs ----------
+mkdir -p "$VENVS_DIR"
+
+create_venv() {
+    local name="$1"
+    if [ ! -d "$VENVS_DIR/$name" ]; then
+        echo "Creating venv: $name"
+        uv venv "$VENVS_DIR/$name"
+    else
+        echo "Venv exists: $name"
+    fi
+}
+
+create_venv quant
+create_venv eval
+create_venv deploy
+
+echo ""
+echo "=== Setup complete ==="
+echo "Activate a venv with: uva quant | uva eval | uva deploy"
+echo "Install llm-compressor: uva quant && uv pip install -e $REPOS_DIR/llm-compressor"
