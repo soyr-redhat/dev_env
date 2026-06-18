@@ -35,6 +35,17 @@ const VRAM_FROM_GPU = {
   'NVIDIA-L40S': 48,
 };
 
+const TASK_MAP = {
+  'text-generation': 'text',
+  'text2text-generation': 'text',
+  'conversational': 'text',
+  'image-text-to-text': 'multimodal',
+  'visual-question-answering': 'multimodal',
+  'any-to-any': 'multimodal',
+  'feature-extraction': 'embedding',
+  'sentence-similarity': 'embedding',
+};
+
 function titleCase(str) {
   return str
     .replace(/[-_]+/g, ' ')
@@ -58,7 +69,7 @@ function inferPrecision(modelId) {
 
 function inferParams(modelId) {
   const match = modelId.match(/(\d+\.?\d*)\s*[bB]\b/);
-  return match ? `${match[1]}B` : 'TODO';
+  return match ? `${match[1]}B` : null;
 }
 
 function inferActiveParams(modelId) {
@@ -73,7 +84,93 @@ function inferVram(nodeSelector) {
   return (gpu && VRAM_FROM_GPU[gpu]) || 80;
 }
 
-function convert(input) {
+function formatParamCount(total) {
+  if (!total) return null;
+  const billions = total / 1e9;
+  if (billions >= 1) {
+    const rounded = Math.round(billions * 10) / 10;
+    return rounded % 1 === 0 ? `${rounded}B` : `${rounded}B`;
+  }
+  const millions = total / 1e6;
+  return `${Math.round(millions)}M`;
+}
+
+function inferArchitecture(architectures, modelType) {
+  const combined = [...(architectures || []), modelType || ''].join(' ').toLowerCase();
+  if (/moe|mixture/i.test(combined)) return 'moe';
+  return 'dense';
+}
+
+function extractDescription(readmeText) {
+  if (!readmeText) return null;
+  let text = readmeText;
+  if (text.startsWith('---')) {
+    const endIdx = text.indexOf('---', 3);
+    if (endIdx !== -1) text = text.slice(endIdx + 3);
+  }
+  text = text.trim();
+  const lines = text.split('\n');
+  const paragraphLines = [];
+  let foundContent = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!foundContent) {
+      if (trimmed.startsWith('#') || trimmed === '') continue;
+      if (/^<[^>]+>/.test(trimmed)) continue;
+      if (/^!\[/.test(trimmed)) continue;
+      if (/^>\s*\[!/.test(trimmed)) continue;
+      foundContent = true;
+    }
+    if (foundContent) {
+      if (trimmed === '' && paragraphLines.length > 0) break;
+      if (trimmed.startsWith('#')) break;
+      if (/^<[^>]+>/.test(trimmed) && paragraphLines.length === 0) continue;
+      paragraphLines.push(trimmed);
+    }
+  }
+  let desc = paragraphLines.join(' ')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/^>\s*/gm, '')
+    .trim();
+  if (desc.length > 150) {
+    desc = desc.slice(0, 147).replace(/\s+\S*$/, '') + '...';
+  }
+  return desc || null;
+}
+
+async function fetchHuggingFaceMetadata(modelId) {
+  try {
+    const [apiRes, readmeRes] = await Promise.all([
+      fetch(`https://huggingface.co/api/models/${modelId}`, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(10000),
+      }),
+      fetch(`https://huggingface.co/${modelId}/resolve/main/README.md`, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(10000),
+      }),
+    ]);
+
+    const hf = apiRes.ok ? await apiRes.json() : null;
+    const readme = readmeRes.ok ? await readmeRes.text() : null;
+
+    if (!hf) return null;
+
+    return {
+      pipelineTag: hf.pipeline_tag,
+      architectures: hf.config?.architectures,
+      modelType: hf.config?.model_type,
+      totalParams: hf.safetensors?.total,
+      maxPositionEmbeddings: hf.config?.max_position_embeddings
+        || hf.config?.text_config?.max_position_embeddings,
+      description: extractDescription(readme),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function convert(input) {
   const docs = yaml.loadAll(input);
   const pod = docs.find(
     (d) => d && (d.kind === 'Pod' || d.kind === 'Deployment')
@@ -142,8 +239,6 @@ function convert(input) {
     if (shm?.emptyDir?.sizeLimit) shmSize = shm.emptyDir.sizeLimit;
   }
 
-  const paramCount = inferParams(repo);
-  const activeParams = inferActiveParams(repo) || paramCount;
   const precision = inferPrecision(modelId);
 
   let contextLength = 8192;
@@ -152,17 +247,25 @@ function convert(input) {
     if (match) contextLength = parseInt(match[1]);
   }
 
+  const hf = await fetchHuggingFaceMetadata(modelId);
+
+  const paramCount = formatParamCount(hf?.totalParams) || inferParams(repo) || 'TODO';
+  const activeParams = inferActiveParams(repo) || paramCount;
+  const task = (hf?.pipelineTag && TASK_MAP[hf.pipelineTag]) || 'text';
+  const architecture = hf ? inferArchitecture(hf.architectures, hf.modelType) : 'dense';
+  if (hf?.maxPositionEmbeddings) contextLength = hf.maxPositionEmbeddings;
+
   const recipe = {
     meta: {
       title: titleCase(repo),
       provider: inferProvider(org),
-      description: 'TODO: Add model description',
+      description: hf?.description || 'TODO: Add model description',
       date_updated: new Date().toISOString().split('T')[0],
-      tasks: ['text'],
+      tasks: [task],
     },
     model: {
       model_id: modelId,
-      architecture: 'dense',
+      architecture,
       parameter_count: paramCount,
       active_parameters: activeParams,
       context_length: contextLength,
@@ -198,4 +301,4 @@ function convert(input) {
 }
 
 const input = readFileSync(process.argv[2] || '/dev/stdin', 'utf8');
-process.stdout.write(convert(input));
+process.stdout.write(await convert(input));
