@@ -1,4 +1,4 @@
-name: Sync deployment recipes
+name: Notify recipe sync
 
 on:
   push:
@@ -7,102 +7,37 @@ on:
       - "deployments/**"
 
 jobs:
-  sync:
+  dispatch:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout dev_env
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 2
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install dependencies
-        run: npm install js-yaml
-
-      - name: Detect changed deployments
-        id: changed
+      - name: Detect and dispatch changed deployments
         run: |
           FILES=$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- 'deployments/*.yaml' 'deployments/*.yml')
           if [ -z "$FILES" ]; then
-            echo "files=" >> "$GITHUB_OUTPUT"
             echo "No deployment files changed"
-          else
-            echo "files<<EOF" >> "$GITHUB_OUTPUT"
-            echo "$FILES" >> "$GITHUB_OUTPUT"
-            echo "EOF" >> "$GITHUB_OUTPUT"
-            echo "Changed files:"
-            echo "$FILES"
+            exit 0
           fi
 
-      - name: Checkout recipes repo
-        if: steps.changed.outputs.files != ''
-        uses: actions/checkout@v4
-        with:
-          repository: neuralmagic/vllm-openshift-recipes
-          token: ${{ secrets.RECIPES_REPO_TOKEN }}
-          path: recipes-repo
+          echo "Changed files:"
+          echo "$FILES"
 
-      - name: Convert and stage recipes
-        if: steps.changed.outputs.files != ''
-        id: convert
-        run: |
-          BRANCH="auto/sync-recipes-$(date +%Y%m%d-%H%M%S)"
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-
-          cd recipes-repo
-          git checkout -b "$BRANCH"
-
-          CONVERTED=0
+          PAYLOAD='[]'
           while IFS= read -r file; do
             [ -z "$file" ] && continue
+            CONTENT=$(cat "$file")
+            PAYLOAD=$(echo "$PAYLOAD" | jq --arg name "$file" --arg content "$CONTENT" '. + [{"filename": $name, "content": $content}]')
+          done <<< "$FILES"
 
-            echo "Converting $file..."
-            RECIPE=$(node ../scripts/convert-deployment.mjs "../$file")
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.RECIPES_REPO_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/neuralmagic/vllm-openshift-recipes/dispatches \
+            -d "$(jq -n --argjson files "$PAYLOAD" '{event_type: "sync-deployment", client_payload: {files: $files}}')"
 
-            MODEL_ID=$(echo "$RECIPE" | grep 'model_id:' | head -1 | sed 's/.*model_id: *//')
-            ORG=$(echo "$MODEL_ID" | cut -d'/' -f1 | tr '[:upper:]' '[:lower:]')
-            REPO=$(echo "$MODEL_ID" | cut -d'/' -f2-)
-            SLUG=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
-
-            mkdir -p "docs/models/$ORG"
-            echo "$RECIPE" > "docs/models/$ORG/$SLUG.yaml"
-            echo "  → docs/models/$ORG/$SLUG.yaml"
-            CONVERTED=$((CONVERTED + 1))
-          done <<< "${{ steps.changed.outputs.files }}"
-
-          echo "count=$CONVERTED" >> "$GITHUB_OUTPUT"
-
-      - name: Create PR
-        if: steps.convert.outputs.count > 0
-        run: |
-          cd recipes-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/models/
-          git commit -m "add: auto-synced model recipes from dev_env"
-          git push origin "${{ steps.convert.outputs.branch }}"
-
-          BODY=$(cat <<'PREOF'
-          ## Summary
-
-          Auto-generated from deployment YAMLs in [dev_env/deployments](https://github.com/soyr-redhat/dev_env/tree/main/deployments).
-
-          **Review checklist — fill in the TODO placeholders:**
-          - [ ] `meta.description` — add a one-line model description
-          - [ ] `meta.tasks` — verify task type (text, multimodal, embedding, omni)
-          - [ ] `model.architecture` — verify (dense or moe)
-          - [ ] `variants.default.description` — add variant description
-          - [ ] Add `guide` section if desired
-          PREOF
-          )
-
-          gh pr create \
-            --title "add: auto-synced model recipes" \
-            --body "$BODY" \
-            --reviewer soyr-redhat
+          echo "Dispatched to vllm-openshift-recipes"
         env:
           GH_TOKEN: ${{ secrets.RECIPES_REPO_TOKEN }}
